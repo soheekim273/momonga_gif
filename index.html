@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ASCII Momonga</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Jua&display=swap">
+  <style>
+    :root {
+      --bg: #04060c;
+      --panel: rgba(14, 18, 30, 0.85);
+      --fg: #e2e8f4;
+      --muted: #8a95aa;
+      --accent: #ffcf5a;
+      --line: rgba(255, 255, 255, 0.12);
+    }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); overflow: hidden;
+      font-family: system-ui, "Malgun Gothic", "Apple SD Gothic Neo", sans-serif; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    video { display: none; }
+
+    #msg { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); max-width: min(520px, calc(100vw - 32px));
+      box-sizing: border-box; background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+      padding: 18px 20px; line-height: 1.6; display: none; }
+    #hint { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
+      display: flex; align-items: center; gap: 8px; padding: 9px 20px 10px;
+      border-radius: 999px; background: rgba(255, 255, 255, 0.1); border: 2px dashed #a8dcff;
+      color: #fff; font-family: "Jua", system-ui, sans-serif; font-size: 17px; letter-spacing: 0.02em;
+      text-shadow: 0 0 10px rgba(255, 170, 200, 0.85);
+      box-shadow: 0 0 18px rgba(168, 220, 255, 0.35); backdrop-filter: blur(4px);
+      white-space: nowrap; pointer-events: none; animation: bob 2.4s ease-in-out infinite; }
+    #hint .icon { display: inline-block; font-size: 19px; animation: wiggle 1.2s ease-in-out infinite; }
+    #hint .icon.late { animation-delay: 0.6s; }
+    @keyframes bob { 0%, 100% { transform: translate(-50%, 0); } 50% { transform: translate(-50%, -6px); } }
+    @keyframes wiggle { 0%, 100% { transform: rotate(-12deg) scale(1); } 50% { transform: rotate(12deg) scale(1.15); } }
+    @media (max-width: 420px) { #hint { font-size: 15px; padding: 8px 14px; } }
+    #msg code { background: rgba(255, 255, 255, 0.08); padding: 1px 5px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <canvas id="view"></canvas>
+  <video id="video" src="../resource/momonga.mp4" loop muted playsinline autoplay></video>
+
+  <div id="msg"></div>
+  <div id="hint"><span class="icon">🎅</span>모자 혹은 배경을 클릭해보세요<span class="icon late">❄️</span></div>
+
+  <script>
+  // ===================================================================
+  //  비디오 -> ASCII 아트
+  //  1) 비디오 한 프레임을 "글자 칸 수" 크기로 줄여서 그린다 (1픽셀 = 1칸)
+  //  2) 각 픽셀의 밝기로 글자를 고르고, 원래 색으로 칠한다
+  //  3) 테두리 색과 비슷한 픽셀은 배경으로 보고 지운다 -> 그 자리에 별과 눈
+  //  4) 밝은 글자만 흐리게 한 번 더 겹쳐서 빛나게 한다
+  // ===================================================================
+  const RAMP = ".-~=*vx%&W#@";       // 어두움 -> 밝음 (트리의 잎과 같은 계열)
+  // 고정 설정: 글자 크기 / 대비 / 배경 지우기 / 빛 번짐
+  const S = { fs: 8, contrast: 1, bgcut: 0.05, glow: 0.4 };
+  const SNOW = Math.round(180 * 1.2);   // 눈송이 개수
+
+  const canvas = document.getElementById("view"), ctx = canvas.getContext("2d");
+  const off = document.createElement("canvas"), octx = off.getContext("2d");
+  const glowC = document.createElement("canvas"), gctx = glowC.getContext("2d");
+  const sample = document.createElement("canvas"), sctx = sample.getContext("2d", { willReadFrequently: true });
+  const video = document.getElementById("video"), msgEl = document.getElementById("msg");
+
+  // ---------- 화면 격자 ----------
+  let W, H, DPR, FONT, CW, CH, ROWS, COLS, N, VC = 0, VR = 0, R0 = 0, C0 = 0;
+  let chars, cols;
+  const clamp = (v, a = 0, b = 1) => (v < a ? a : v > b ? b : v);
+
+  function layout() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    for (const c of [canvas, off, glowC]) { c.width = W * DPR; c.height = H * DPR; }
+    FONT = `${S.fs}px ui-monospace, Consolas, "Courier New", monospace`;
+    octx.font = FONT;
+    CW = octx.measureText("M").width; CH = Math.round(S.fs * 1.15);
+    COLS = Math.ceil(W / CW); ROWS = Math.ceil(H / CH); N = ROWS * COLS;
+    chars = new Array(N); cols = new Float32Array(N * 3);
+
+    // 비디오를 화면 안에 비율 유지해서 맞추기 (칸 단위)
+    if (video.videoWidth) {
+      const a = video.videoWidth / video.videoHeight, maxC = Math.floor(COLS * 0.94), maxR = Math.floor(ROWS * 0.94);
+      VC = maxC; VR = Math.round(VC * CW / (a * CH));
+      if (VR > maxR) { VR = maxR; VC = Math.round(VR * CH * a / CW); }
+      sample.width = VC; sample.height = VR;
+      C0 = Math.floor((COLS - VC) / 2); R0 = Math.floor((ROWS - VR) / 2);
+    }
+  }
+
+  // ---------- 배경: 별과 눈 ----------
+  let seed = 7;
+  const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  const stars = Array.from({ length: 450 }, () => [rand(), rand(), 0.5 + 2.5 * rand(), 6.28 * rand()]);
+  const flakes = Array.from({ length: SNOW }, () => [rand(), rand(), 1.5 + 2.3 * rand()]);
+
+  function set(row, col, ch, r, g, b) {
+    if (row < 0 || row >= ROWS || col < 0 || col >= COLS) return;
+    const i = row * COLS + col;
+    chars[i] = ch; cols[i * 3] = r; cols[i * 3 + 1] = g; cols[i * 3 + 2] = b;
+  }
+
+  // ---------- 비디오의 배경색 추정: 테두리 픽셀의 중간값 ----------
+  function borderColor(d) {
+    const rs = [], gs = [], bs = [];
+    const take = (x, y) => { const i = (y * VC + x) * 4; rs.push(d[i]); gs.push(d[i + 1]); bs.push(d[i + 2]); };
+    for (let x = 0; x < VC; x++) { take(x, 0); take(x, VR - 1); }
+    for (let y = 0; y < VR; y++) { take(0, y); take(VC - 1, y); }
+    const med = a => a.sort((p, q) => p - q)[a.length >> 1];
+    return [med(rs), med(gs), med(bs)];
+  }
+
+  // ---------- 배경 마스크: 테두리에서 시작해 "배경색과 비슷하고 이어진" 칸만 배경 ----------
+  // 그냥 색만 비교하면 흰 배경과 같은 색인 흰 얼굴까지 지워짐.
+  // 테두리에서 물감을 붓듯 퍼뜨리면(flood fill) 윤곽선 안쪽의 흰 얼굴은 닿지 않아서 남는다.
+  let mask = new Uint8Array(0), queue = new Int32Array(0);
+  function backgroundMask(d) {
+    const n = VC * VR;
+    if (mask.length !== n) { mask = new Uint8Array(n); queue = new Int32Array(n); }
+    mask.fill(0);
+    if (S.bgcut <= 0) return mask;
+    const [br, bg, bb] = borderColor(d), cut = S.bgcut * 441;    // 441 = RGB 최대 거리
+    const near = p => Math.hypot(d[p * 4] - br, d[p * 4 + 1] - bg, d[p * 4 + 2] - bb) < cut;
+    let head = 0, tail = 0;
+    const push = p => { if (!mask[p] && near(p)) { mask[p] = 1; queue[tail++] = p; } };
+    for (let x = 0; x < VC; x++) { push(x); push((VR - 1) * VC + x); }
+    for (let y = 0; y < VR; y++) { push(y * VC); push(y * VC + VC - 1); }
+    while (head < tail) {                                          // 상하좌우로만 퍼짐
+      const p = queue[head++], x = p % VC;
+      if (x > 0) push(p - 1);
+      if (x < VC - 1) push(p + 1);
+      if (p >= VC) push(p - VC);
+      if (p < n - VC) push(p + VC);
+    }
+    return mask;
+  }
+
+  // ---------- 산타 옷 ----------
+  // 위치 비율은 영상에 맞춰 조절 (s = 머리 폭, 실루엣 높이 기준)
+  const COSTUME = {
+    hatY: 0.22,     // 모자 털 띠 위치: 실루엣 맨 위에서 머리 폭의 몇 배 아래
+    hat: 0.65,      // 모자 크기: 머리 폭 대비
+    hatTilt: 15,    // 모자 기울기 (도, +면 오른쪽)
+  };
+  const RED = [0.86, 0.14, 0.16];
+  const FURCH = "@#&W%";
+  const hash = (a, b) => { let h = (a * 374761393 + b * 668265263) | 0; h = Math.imul(h ^ (h >>> 13), 1274126177); return ((h ^ (h >>> 16)) >>> 0) / 4294967296; };
+
+  // 실루엣(배경이 아닌 칸)에서 머리 꼭대기, 머리 중심, 머리 폭, 아래 끝을 찾음
+  let track = null;
+  function trackBody(isBg) {
+    const rowCnt = new Int32Array(VR), rowMin = new Int32Array(VR).fill(VC), rowMax = new Int32Array(VR).fill(-1);
+    let total = 0;
+    for (let y = 0; y < VR; y++) for (let x = 0; x < VC; x++) {
+      if (isBg[y * VC + x]) continue;
+      rowCnt[y]++; total++;
+      if (x < rowMin[y]) rowMin[y] = x;
+      if (x > rowMax[y]) rowMax[y] = x;
+    }
+    if (total < 40 || total > VC * VR * 0.85) { track = null; return null; }   // 캐릭터가 없거나 배경 분리 실패
+    let acc = 0, top = 0, bottom = VR - 1;
+    for (let y = 0; y < VR; y++) { acc += rowCnt[y]; if (acc >= total * 0.01) { top = y; break; } }
+    acc = 0;
+    for (let y = VR - 1; y >= 0; y--) { acc += rowCnt[y]; if (acc >= total * 0.01) { bottom = y; break; } }
+    const h = bottom - top;
+    if (h < 6) { track = null; return null; }
+
+    // 머리 영역(위쪽 20~45%)의 가로 중심과 폭
+    let sx = 0, n = 0; const widths = [];
+    for (let y = Math.round(top + h * 0.2); y <= Math.round(top + h * 0.45); y++) {
+      if (rowMax[y] < 0) continue;
+      sx += (rowMin[y] + rowMax[y]) / 2; n++; widths.push(rowMax[y] - rowMin[y]);
+    }
+    if (!n) { track = null; return null; }
+    widths.sort((a, b) => a - b);
+    const cur = {                                       // 픽셀 단위
+      x: (C0 + sx / n + 0.5) * CW, top: (R0 + top) * CH, bottom: (R0 + bottom + 1) * CH,
+      s: widths[widths.length >> 1] * CW,
+    };
+    // 프레임마다 흔들리지 않게 부드럽게 따라감
+    if (!track) track = cur;
+    else for (const k in cur) track[k] += (cur[k] - track[k]) * 0.35;
+    return track;
+  }
+
+  // 픽셀 좌표의 도형을 글자 칸으로 찍기
+  function stamp(x0, y0, x1, y1, shade) {
+    for (let r = Math.max(0, Math.floor(y0 / CH)); r <= Math.min(ROWS - 1, y1 / CH); r++)
+      for (let c = Math.max(0, Math.floor(x0 / CW)); c <= Math.min(COLS - 1, x1 / CW); c++) {
+        const out = shade((c + 0.5) * CW, (r + 0.5) * CH, r, c);
+        if (out) set(r, c, out[0], out[1], out[2], out[3]);
+      }
+  }
+  // (ox, oy) 를 중심으로 deg 도 기울여서 찍기. shade 는 기울이기 전 좌표(dx, dy)를 받음
+  function stampTilted(ox, oy, radius, deg, shade) {
+    const a = deg * Math.PI / 180, ca = Math.cos(a), sa = Math.sin(a);
+    stamp(ox - radius, oy - radius, ox + radius, oy + radius, (px, py, r, c) => {
+      const x = px - ox, y = py - oy;
+      return shade(x * ca + y * sa, -x * sa + y * ca, r, c);   // 화면 -> 기울이기 전 좌표
+    });
+  }
+  const tone = (col, br, ch) => [ch || RAMP[(clamp(br) * (RAMP.length - 0.01)) | 0], col[0] * br, col[1] * br, col[2] * br];
+  const fur = (r, c) => { const v = hash(r, c); return [FURCH[(v * FURCH.length) | 0], 0.85 + 0.15 * v, 0.88 + 0.12 * v, 0.92 + 0.08 * v]; };
+
+  // ---------- 모자 종류: 클릭할 때마다 다음 모자로 ----------
+  // 각 모자는 (dx, dy, s, t, r, c) -> 글자 하나. 좌표는 털 띠(머리에 닿는 부분) 중심 기준, 위쪽이 -y
+  const BROWN = [0.62, 0.4, 0.2], NAVY = [0.22, 0.38, 0.85], GOLD = [1, 0.78, 0.2];
+  const segDist = (px, py, ax, ay, bx, by) => {
+    const vx = bx - ax, vy = by - ay, k = clamp(((px - ax) * vx + (py - ay) * vy) / (vx * vx + vy * vy));
+    return Math.hypot(px - ax - vx * k, py - ay - vy * k);
+  };
+  const ANTLER = [[0.2, 0, 0.3, -0.3], [0.3, -0.3, 0.42, -0.6], [0.3, -0.3, 0.1, -0.5], [0.37, -0.46, 0.58, -0.52]];
+
+  const HATS = [
+    { name: "산타 모자", draw(dx, dy, s, t, r, c) {
+      const tipX = 0.34 * s + 0.03 * s * Math.sin(t * 2.5), tipY = -0.48 * s;
+      if (Math.hypot(dx - tipX, dy - tipY) < 0.1 * s) return fur(r, c);                        // 꼭대기 방울
+      if ((dx / (0.42 * s)) ** 4 + (dy / (0.075 * s)) ** 2 < 1) return fur(r, c);             // 털 띠
+      const u = -(dy + 0.06 * s) / (0.42 * s);                                                // 0 = 밑, 1 = 끝
+      if (u < 0 || u > 1) return null;
+      const off = dx - tipX * u ** 1.6, half = 0.36 * s * (1 - u) ** 0.8 + 0.03 * s;
+      if (Math.abs(off) > half) return null;
+      return tone(RED, 0.55 + 0.45 * clamp(0.5 - off / (2 * half)) - 0.1 * u);
+    } },
+    { name: "루돌프 뿔", draw(dx, dy, s, t, r, c) {
+      const ax = Math.abs(dx), wob = 0.015 * s * Math.sin(t * 3 + (dx > 0 ? 0 : 1.5));
+      let d = Infinity;
+      for (const [x0, y0, x1, y1] of ANTLER) d = Math.min(d, segDist(ax, dy, x0 * s, y0 * s + wob, x1 * s, y1 * s + wob));
+      if (d > 0.05 * s) return null;
+      return tone(BROWN, 0.75 + 0.35 * (1 - d / (0.05 * s)) + (dx < 0 ? 0.1 : 0));
+    } },
+    { name: "털모자", draw(dx, dy, s, t, r, c) {
+      if (Math.hypot(dx, dy + 0.5 * s) < 0.12 * s) return fur(r, c);                          // 방울
+      if (Math.abs(dx) < 0.44 * s && Math.abs(dy) < 0.08 * s)                                 // 접힌 단: 세로 골
+        return tone(NAVY, 0.9 + 0.2 * Math.cos(dx / s * 60), "|");
+      const e = (dx / (0.4 * s)) ** 2 + ((dy + 0.04 * s) / (0.44 * s)) ** 2;
+      if (dy > 0 || e > 1) return null;
+      if (Math.abs(Math.sin(-dy / s * 12)) < 0.3) return tone([1, 1, 1], 0.95);              // 흰 줄무늬
+      return tone(NAVY, 0.55 + 0.45 * clamp(0.6 - dx / s) * (1 - 0.3 * e));
+    } },
+    { name: "왕관", draw(dx, dy, s, t, r, c) {
+      const ax = Math.abs(dx);
+      if (ax > 0.36 * s || dy > 0.06 * s) return null;
+      const shine = 0.5 + 0.5 * Math.sin(t * 3 - dx / s * 6);                                   // 반짝이며 지나가는 빛
+      if (dy > -0.12 * s) {                                                                    // 띠 + 보석
+        if (Math.hypot(ax - 0.18 * s, dy + 0.03 * s) < 0.04 * s) return tone([0.3, 0.6, 1], 1.2, "o");
+        if (Math.hypot(dx, dy + 0.03 * s) < 0.05 * s) return tone(RED, 1.2, "@");
+        return tone(GOLD, 0.7 + 0.4 * shine);
+      }
+      const k = Math.round((dx / s + 0.36) / 0.18), px = (k * 0.18 - 0.36) * s;               // 뾰족한 다섯 갈래
+      const h = -(dy + 0.12 * s) / (0.28 * s);
+      if (h > 1 || Math.abs(dx - px) > 0.09 * s * (1 - h)) return null;
+      return tone(GOLD, 0.65 + 0.45 * shine);
+    } },
+  ];
+  let hatIndex = 0, hatSince = -10, hatHit = null;
+  const easeBack = x => { x = clamp(x); return 1 + 2.7 * (x - 1) ** 3 + 1.7 * (x - 1) ** 2; };
+
+  function drawCostume(b, t) {
+    const hy = b.top + COSTUME.hatY * b.s;
+    const pop = easeBack((t - hatSince) / 0.4);                                              // 바뀔 때 뿅
+    const s = b.s * COSTUME.hat * Math.max(pop, 0.01), hat = HATS[hatIndex];
+    stampTilted(b.x, hy, 0.8 * s, COSTUME.hatTilt, (dx, dy, r, c) => hat.draw(dx, dy, s, t, r, c));
+
+    // 클릭 판정용: 모자 중심(기울기 반영)과 반지름
+    const a = COSTUME.hatTilt * Math.PI / 180, lx = 0.12 * s, ly = -0.25 * s;
+    hatHit = { x: b.x + lx * Math.cos(a) - ly * Math.sin(a), y: hy + lx * Math.sin(a) + ly * Math.cos(a), r: 0.55 * s };
+  }
+
+  // ---------- 눈 팡! ----------
+  const bursts = [];
+  function snowBurst(x, y, col = [0.9, 0.95, 1], n = 46) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2, v = 120 + 380 * Math.random();
+      bursts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 120, age: 0, life: 1.2 + 1.3 * Math.random(),
+        ch: "*+.o"[(Math.random() * 4) | 0], col: Math.random() < 0.3 ? [0.65, 0.85, 1] : col });
+    }
+    bursts.push({ ring: true, x, y, age: 0, life: 0.35 });
+  }
+  function drawBursts(dt) {
+    for (let i = bursts.length - 1; i >= 0; i--) {
+      const p = bursts[i];
+      p.age += dt;
+      if (p.age > p.life) { bursts.splice(i, 1); continue; }
+      const fade = 1 - p.age / p.life;
+      if (p.ring) {                                                                            // 퍼지는 고리
+        const R = 25 + 220 * p.age / p.life;
+        for (let k = 0; k < 48; k++) {
+          const a = k / 48 * Math.PI * 2;
+          set(Math.floor((p.y + Math.sin(a) * R) / CH), Math.floor((p.x + Math.cos(a) * R) / CW), ".", fade, fade, fade);
+        }
+        continue;
+      }
+      p.vx *= Math.exp(-2.2 * dt); p.vy = p.vy * Math.exp(-2.2 * dt) + 260 * dt;              // 공기 저항 + 중력
+      p.x += p.vx * dt + Math.sin(p.age * 5 + p.life * 9) * 12 * dt; p.y += p.vy * dt;          // 살랑살랑
+      const k = 0.35 + 0.75 * fade;
+      set(Math.floor(p.y / CH), Math.floor(p.x / CW), fade < 0.3 ? "." : p.ch, p.col[0] * k, p.col[1] * k, p.col[2] * k);
+    }
+  }
+
+  // ---------- 클릭 / 터치 ----------
+  const overHat = (x, y) => hatHit && Math.hypot(x - hatHit.x, y - hatHit.y) < hatHit.r;
+  canvas.addEventListener("pointerdown", e => {
+    if (overHat(e.clientX, e.clientY)) {
+      hatIndex = (hatIndex + 1) % HATS.length; hatSince = performance.now() / 1000;
+      snowBurst(hatHit.x, hatHit.y, GOLD, 24);
+    } else snowBurst(e.clientX, e.clientY);
+  });
+  canvas.addEventListener("pointermove", e => { canvas.style.cursor = overHat(e.clientX, e.clientY) ? "pointer" : "default"; });
+
+  // ---------- 매 프레임 ----------
+  let tainted = false, lastT = 0;
+  const to255 = v => (v <= 0 ? 0 : v >= 1 ? 255 : (v * 255) | 0);
+
+  function draw(now) {
+    requestAnimationFrame(draw);
+    if (!VC && video.videoWidth) layout();
+    if (!VC || tainted || video.readyState < 2) return;
+    const t = now / 1000, dt = Math.min(0.05, t - (lastT || t));
+    lastT = t;
+    chars.fill(undefined);
+
+    // 1) 배경: 반짝이는 별 + 떨어지는 눈
+    for (const [x, y, w, ph] of stars) {
+      const b = 0.15 + 0.75 * (0.5 + 0.5 * Math.sin(t * w + ph)) ** 3;
+      set((y * ROWS) | 0, (x * COLS) | 0, b > 0.55 ? "+" : ".", b * 0.85, b * 0.9, b);
+    }
+    for (const [x, y, v] of flakes) {
+      const row = (y * ROWS + v * t) % ROWS, col = ((x * COLS + 1.5 * Math.sin(t * 0.8 + v * 16)) % COLS + COLS) % COLS;
+      set(row | 0, col | 0, v > 2.8 ? "*" : ".", 0.75, 0.75, 0.75);
+    }
+
+    // 2) 비디오 프레임을 칸 수 크기로 줄여서 픽셀 읽기
+    let d;
+    try {
+      sctx.drawImage(video, 0, 0, VC, VR);
+      d = sctx.getImageData(0, 0, VC, VR).data;
+    } catch (e) { tainted = true; showFilePicker(); return; }
+
+    // 3) 픽셀 -> 글자
+    const isBg = backgroundMask(d);
+    for (let y = 0; y < VR; y++) for (let x = 0; x < VC; x++) {
+      if (isBg[y * VC + x]) continue;                                     // 배경이면 건너뜀
+      const i = (y * VC + x) * 4, r = d[i], g = d[i + 1], b = d[i + 2];
+      const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+      const l = clamp((lum - 0.5) * S.contrast + 0.5);
+      const k = (c => Math.max(clamp((c / 255 - 0.5) * S.contrast + 0.5) * 1.1, 0.16));
+      set(R0 + y, C0 + x, RAMP[(Math.max(l, 0.05) * (RAMP.length - 0.01)) | 0], k(r), k(g), k(b));
+    }
+
+    // 3-1) 산타 옷: 모몽가 실루엣에서 머리 위치를 찾아 산타 모자를 덧그림
+    const body = trackBody(isBg);
+    if (body) drawCostume(body, t); else hatHit = null;
+    drawBursts(dt);
+
+    // 4) 격자 -> 캔버스 (밝은 글자는 번짐용 캔버스에도)
+    for (const c of [octx, gctx]) { c.setTransform(DPR, 0, 0, DPR, 0, 0); c.font = FONT; c.textBaseline = "top"; }
+    octx.fillStyle = "#04060c"; octx.fillRect(0, 0, W, H);
+    gctx.clearRect(0, 0, W, H);
+    for (let i = 0; i < N; i++) {
+      const ch = chars[i];
+      if (ch === undefined) continue;
+      const r = cols[i * 3], g = cols[i * 3 + 1], b = cols[i * 3 + 2];
+      const style = `rgb(${to255(r)},${to255(g)},${to255(b)})`, x = (i % COLS) * CW, y = ((i / COLS) | 0) * CH;
+      octx.fillStyle = style; octx.fillText(ch, x, y);
+      if (Math.max(r, g, b) > 0.85) { gctx.fillStyle = style; gctx.fillText(ch, x, y); }
+    }
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalCompositeOperation = "source-over"; ctx.filter = "none"; ctx.globalAlpha = 1;
+    ctx.drawImage(off, 0, 0);
+    if (S.glow > 0) {
+      ctx.globalCompositeOperation = "lighter";
+      ctx.filter = `blur(${4 * DPR}px)`; ctx.globalAlpha = 0.6 * S.glow; ctx.drawImage(glowC, 0, 0);
+      ctx.filter = `blur(${12 * DPR}px)`; ctx.globalAlpha = 0.4 * S.glow; ctx.drawImage(glowC, 0, 0);
+      ctx.filter = "none"; ctx.globalAlpha = 1; ctx.globalCompositeOperation = "source-over";
+    }
+  }
+
+  // ---------- 안내 메시지 ----------
+  function showFilePicker(reason) {
+    msgEl.innerHTML = `<b>${reason || "비디오 픽셀을 읽을 수 없어요."}</b><br>
+      index.html 을 더블클릭(file://)으로 열면 브라우저 보안 때문에 비디오 픽셀을 읽을 수 없어요.<br><br>
+      · VS Code에서 <code>Live Server</code> 확장으로 열거나<br>
+      · <code>funny_code</code> 폴더에서 <code>npx serve</code> 후 <code>/momonga/</code> 로 접속하거나<br>
+      · 아래 버튼으로 비디오 파일을 직접 골라 주세요.<br><br>
+      <input type="file" accept="video/*">`;
+    msgEl.style.display = "block";
+    msgEl.querySelector("input").addEventListener("change", ev => {
+      const f = ev.target.files[0];
+      if (!f) return;
+      video.src = URL.createObjectURL(f); video.play();
+      tainted = false; msgEl.style.display = "none";
+    });
+  }
+  video.addEventListener("error", () => showFilePicker("../resource/momonga.mp4 를 불러오지 못했어요."));
+  video.addEventListener("loadedmetadata", layout);
+
+  window.addEventListener("resize", layout);
+  layout();
+  video.play().catch(() => {});
+  requestAnimationFrame(draw);
+  </script>
+</body>
+</html>
